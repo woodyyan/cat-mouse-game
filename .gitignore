@@ -1,0 +1,36 @@
+# 仅提交必要文件：index.html / README.md / .gitignore
+# 其余系统、编辑器、依赖、构建与部署产物一律忽略
+
+# macOS / Windows 系统文件
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+desktop.ini
+
+# 编辑器 / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 依赖与构建产物
+node_modules/
+dist/
+build/
+out/
+coverage/
+
+# Vercel 本地产物与环境变量
+.vercel/
+.env
+.env.*
+*.local
+
+# 日志、缓存与临时文件
+*.log
+*.tmp
+*.bak
+.cache/
+.workbuddy/
