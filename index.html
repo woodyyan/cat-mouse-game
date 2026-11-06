@@ -34,15 +34,30 @@
   var cv = document.getElementById('stage');
   var ctx = cv.getContext('2d', {alpha:false});
   var hint = document.getElementById('hint');
-  var W=0, H=0, DPR=1, bgGrad=null, S=1;
+  var W=0, H=0, DPR=1, bgCanvas=null, S=1;
   var clock=0, last=0;
   var mouse=null;
   var particles=[];
   var fsAttempts=0, wakeLock=null;
   var soundReady=false, sfx={squeak:[],rustle:[],death:[]}, keepAlive=null;
   var hintTimer=null;
+  // 预渲染精灵：渐变、阴影、复杂贝塞尔路径一次烘焙，运行时每帧只 drawImage
+  var SPRITE_N=16, SPRITE_FPS=20;
+  var sprites=[], sprW=0, sprH=0, sprCx=0, sprCy=0;
 
   // ---------- 尺寸 / 背景 ----------
+  function buildBackground(){
+    bgCanvas = document.createElement('canvas');
+    bgCanvas.width  = Math.max(1, Math.round(W));   // 渐变平滑，DPR=1 足够
+    bgCanvas.height = Math.max(1, Math.round(H));
+    var g = bgCanvas.getContext('2d');
+    var grad = g.createRadialGradient(W*0.5, H*0.45, 0, W*0.5, H*0.45, Math.max(W,H)*0.78);
+    grad.addColorStop(0, '#101a33');
+    grad.addColorStop(1, '#04060e');
+    g.fillStyle = grad;
+    g.fillRect(0, 0, W, H);
+  }
+
   function resize(){
     W = window.innerWidth;
     H = window.innerHeight;
@@ -52,9 +67,9 @@
     cv.style.width = W+'px';
     cv.style.height = H+'px';
     S = Math.max(1.0, Math.min(1.9, Math.min(W,H)/480));
-    bgGrad = ctx.createRadialGradient(W*0.5, H*0.45, 0, W*0.5, H*0.45, Math.max(W,H)*0.78);
-    bgGrad.addColorStop(0, '#101a33');
-    bgGrad.addColorStop(1, '#04060e');
+    if(mouse) mouse.s = S;
+    buildBackground();
+    buildSprites();
   }
 
   // ---------- 声音：预合成 WAV + HTMLAudioElement ----------
@@ -268,22 +283,43 @@
     return d;
   }
 
+  // 目标点可落在屏幕外，逼老鼠冲到边缘；小概率直接反向折返
   function pickTarget(m){
-    var pad = 100*S;
-    m.tx = pad + Math.random()*Math.max(1, W-2*pad);
-    m.ty = pad + Math.random()*Math.max(1, H-2*pad);
-    m.retarget = 0.7 + Math.random()*2.1;
+    var pad = 34*S;
+    m.tx = -pad + Math.random()*(W + 2*pad);
+    m.ty = -pad + Math.random()*(H + 2*pad);
+    if(Math.random() < 0.18){
+      m.tx = m.x - (m.tx - m.x)*0.85;
+      m.ty = m.y - (m.ty - m.y)*0.85;
+    }
+    m.retarget = 0.35 + Math.random()*1.25;
   }
 
+  function bounceTarget(m){
+    m.tx = W*(0.12 + Math.random()*0.76);
+    m.ty = H*(0.12 + Math.random()*0.76);
+    m.retarget = 0.45 + Math.random()*0.9;
+  }
+
+  // 五档速度：潜伏 / 常速 / 爆发冲刺 / 急停急转，换档间隔 0.28–1.3s
   function newSpeed(m){
-    m.targetSpeed = 150 + Math.random()*250;          // px/s，慢走 → 快跑
-    m.speedChange = 0.6 + Math.random()*1.8;
     var r = Math.random();
-    if(r < 0.12){                                     // 突然冲刺
-      m.targetSpeed *= 1.9;
-      m.speedChange = 0.35 + Math.random()*0.5;
-    } else if(r < 0.22){                              // 猎物式短暂停顿
-      m.freeze = 0.25 + Math.random()*0.55;
+    m.lockedTurn = 0;
+    if(r < 0.14){                                   // 潜伏慢走 70–180 px/s
+      m.targetSpeed = 70 + Math.random()*110;
+      m.speedChange = 0.3 + Math.random()*0.65;
+    }else if(r < 0.34){                             // 爆发冲刺 780–1200 px/s，近直线
+      m.targetSpeed = 780 + Math.random()*420;
+      m.speedChange = 0.28 + Math.random()*0.5;
+      m.lockedTurn = m.speedChange*0.85;
+    }else if(r < 0.45){                             // 急停 + 停后大幅度变向
+      m.freeze = 0.15 + Math.random()*0.4;
+      m.pendingTurn = (Math.random()<0.5 ? -1 : 1)*(1.1 + Math.random()*1.6);
+      m.targetSpeed = 100 + Math.random()*140;
+      m.speedChange = m.freeze + 0.05;
+    }else{                                          // 常规变奏 260–640 px/s
+      m.targetSpeed = 260 + Math.random()*380;
+      m.speedChange = 0.3 + Math.random()*1.0;
     }
   }
 
@@ -292,6 +328,8 @@
       s:S, x:0, y:0, heading:0, tx:0, ty:0,
       speed:240, targetSpeed:240,
       retarget:0, speedChange:0, freeze:0,
+      lockedTurn:0, pendingTurn:0,
+      animPhase:Math.random()*SPRITE_N,
       soundTimer:0.25 + Math.random()*0.5,
       rustleTimer:0.5 + Math.random(),
       seed:Math.random()*100,
@@ -306,7 +344,8 @@
       else { m.x = W*Math.random(); m.y = H + off; }
       m.heading = Math.atan2(ty - m.y, tx - m.x);
       m.tx = tx; m.ty = ty; m.retarget = 1.1;
-      m.speed = 420; m.targetSpeed = 420; m.speedChange = 0.9;
+      m.speed = 650 + Math.random()*250;
+      m.targetSpeed = m.speed; m.speedChange = 0.9;
     }else{
       m.x = W*(0.35 + Math.random()*0.3);
       m.y = H*(0.35 + Math.random()*0.3);
@@ -326,29 +365,29 @@
     var m = mouse;
     m.retarget -= dt;
     m.speedChange -= dt;
+    m.lockedTurn -= dt;
     if(m.retarget <= 0) pickTarget(m);
     if(m.speedChange <= 0) newSpeed(m);
 
-    var desired = Math.atan2(m.ty - m.y, m.tx - m.x);
-    // 随机游走扰动：让轨迹不可预测
-    desired += Math.sin(clock*2.3 + m.seed)*0.34
-             + Math.sin(clock*5.7 + m.seed*2)*0.17
-             + (Math.random()-0.5)*0.22;
-
-    // 靠近边缘时转向屏幕中心
-    var pad = 90*S;
-    if(!m.entering && (m.x < pad || m.x > W-pad || m.y < pad || m.y > H-pad)){
-      desired = Math.atan2(H*0.5 - m.y, W*0.5 - m.x) + (Math.random()-0.5)*0.7;
-    }
-
-    var turn = clamp(angleDiff(desired, m.heading), -2.8*dt, 2.8*dt);
-    m.heading += turn;
+    // 多频平滑扰动：轨迹难预测，但不会逐帧抖动
+    var desired = Math.atan2(m.ty - m.y, m.tx - m.x)
+                + Math.sin(clock*2.3 + m.seed)*0.42
+                + Math.sin(clock*6.1 + m.seed*2)*0.22
+                + Math.sin(clock*11.3 + m.seed*3)*0.09;
+    var turnRate = m.lockedTurn > 0 ? 1.3 : 3.6 + 1.6*Math.sin(clock*1.7 + m.seed);
+    m.heading += clamp(angleDiff(desired, m.heading), -turnRate*dt, turnRate*dt);
 
     if(m.freeze > 0){
       m.freeze -= dt;
-      m.speed += (0 - m.speed)*Math.min(1, dt*7);
+      m.speed += (0 - m.speed)*Math.min(1, dt*12);
+      if(m.freeze <= 0 && m.pendingTurn){
+        m.heading += m.pendingTurn;
+        m.pendingTurn = 0;
+        pickTarget(m);
+      }
     }else{
-      m.speed += (m.targetSpeed - m.speed)*Math.min(1, dt*3.2);
+      var accel = m.targetSpeed > m.speed ? 10 : 8;   // 快起快停，忽快忽慢
+      m.speed += (m.targetSpeed - m.speed)*Math.min(1, dt*accel);
     }
     m.x += Math.cos(m.heading)*m.speed*dt;
     m.y += Math.sin(m.heading)*m.speed*dt;
@@ -356,192 +395,214 @@
     if(m.entering){
       if(m.x > 40*S && m.x < W-40*S && m.y > 40*S && m.y < H-40*S) m.entering = false;
     }else{
-      m.x = clamp(m.x, 24*S, W-24*S);
-      m.y = clamp(m.y, 24*S, H-24*S);
+      // 真正跑到边缘再镜面反弹折返，而不是提前被拉回中心
+      var e = 10*S, jitter = (Math.random()-0.5)*0.9, hit = false;
+      if(m.x < e){ m.x = e; m.heading = Math.PI - m.heading + jitter; hit = true; }
+      else if(m.x > W-e){ m.x = W-e; m.heading = Math.PI - m.heading + jitter; hit = true; }
+      if(m.y < e){ m.y = e; m.heading = -m.heading + jitter; hit = true; }
+      else if(m.y > H-e){ m.y = H-e; m.heading = -m.heading + jitter; hit = true; }
+      if(hit) bounceTarget(m);
     }
+
+    // 步态播放速率跟随速度：慢走慢摆、冲刺快摆
+    m.animPhase += dt*SPRITE_FPS*(0.5 + Math.min(1.4, m.speed/430));
 
     // 只在跑动时发声
     if(m.speed > 75){
       m.soundTimer -= dt;
       m.rustleTimer -= dt;
-      if(m.soundTimer <= 0){ squeak(); m.soundTimer = 0.38 + Math.random()*0.95; }
-      if(m.rustleTimer <= 0){ rustle(); m.rustleTimer = 0.6 + Math.random()*1.5; }
+      if(m.soundTimer <= 0){ squeak(); m.soundTimer = 0.3 + Math.random()*0.85; }
+      if(m.rustleTimer <= 0){ rustle(); m.rustleTimer = 0.55 + Math.random()*1.3; }
     }
   }
 
-  function drawMouse(m){
+  // ---------- 预渲染精灵 ----------
+  // 把渐变、shadowBlur 发光、贝塞尔轮廓等重活一次性烘焙成 16 帧动画，
+  // 运行时每帧只做 1 次背景 drawImage + 1 次老鼠 drawImage。
+  function renderMouseSprite(g, s, p){
     var TAU = Math.PI*2;
-    var s = m.s;
-    var fade = m.alive ? 1 : Math.max(0, 1 - m.deadT/0.42);
-    if(fade <= 0) return;
-    var run = Math.min(1, Math.max(0, (m.speed - 60)/260));
-    var bob = Math.sin(clock*15)*2*s*run;
-    var stretch = 1 + Math.sin(clock*15 + 1)*0.028*run;
-    var earFlap = Math.sin(clock*17 + m.seed)*1.2*s*run;
-    var deadScale = m.alive ? 1 : Math.max(0.6, 1 - m.deadT*0.75);
+    var bob = Math.sin(p*3)*2*s;
+    var stretch = 1 + Math.sin(p*3 + 1)*0.028;
+    var earFlap = Math.sin(p*5)*1.2*s;
 
-    ctx.save();
-    ctx.globalAlpha = fade;
-    ctx.translate(m.x, m.y + bob);
+    g.save();
+    g.translate(0, bob);
 
-    // 地面柔光：不随朝向旋转，让老鼠贴住画面
-    var halo = ctx.createRadialGradient(0, 0, 0, 0, 0, 62*s);
+    var halo = g.createRadialGradient(0, 0, 0, 0, 0, 52*s);
     halo.addColorStop(0, 'rgba(240,255,80,.16)');
     halo.addColorStop(1, 'rgba(240,255,80,0)');
-    ctx.fillStyle = halo;
-    ctx.beginPath(); ctx.arc(0, 0, 62*s, 0, TAU); ctx.fill();
+    g.fillStyle = halo;
+    g.beginPath(); g.arc(0, 0, 52*s, 0, TAU); g.fill();
 
-    ctx.rotate(m.heading + (m.alive ? 0 : m.deadT*3.2));
-    ctx.scale(stretch*deadScale, (1 + (1-stretch)*0.5)*deadScale);
+    g.scale(stretch, 1 + (1-stretch)*0.5);
 
-    // ---------- 尾巴：锥形蓝色，波动沿长度传播 ----------
+    // 尾巴：锥形蓝色，波动沿长度传播
     var N = 11, pts = [];
     for(var i=0;i<=N;i++){
       var u = i/N;
-      var sway = Math.sin(clock*6 - u*3.4 + m.seed)*(3 + 15*u)*s +
-                 Math.sin(u*2.6 + m.seed)*3*s*u;
+      var sway = Math.sin(p - u*3.4)*(3 + 15*u)*s + Math.sin(u*2.6)*3*s*u;
       pts.push([-30*s - u*56*s, sway]);
     }
-    ctx.lineCap = 'round';
+    g.lineCap = 'round';
     for(var i=0;i<N;i++){
       var u = i/N;
-      ctx.beginPath();
-      ctx.moveTo(pts[i][0], pts[i][1]);
-      ctx.lineTo(pts[i+1][0], pts[i+1][1]);
-      ctx.lineWidth = (4.6 - 3.5*u)*s;
-      ctx.strokeStyle = 'rgb(' + Math.round(169-90*u) + ',' + Math.round(230-72*u) +
-                        ',' + Math.round(255-36*u) + ')';
-      ctx.stroke();
+      g.beginPath();
+      g.moveTo(pts[i][0], pts[i][1]);
+      g.lineTo(pts[i+1][0], pts[i+1][1]);
+      g.lineWidth = (4.6 - 3.5*u)*s;
+      g.strokeStyle = 'rgb(' + Math.round(169-90*u) + ',' + Math.round(230-72*u) +
+                      ',' + Math.round(255-36*u) + ')';
+      g.stroke();
     }
-    ctx.strokeStyle = 'rgba(255,255,255,.34)';
-    ctx.lineWidth = 0.9*s;
-    ctx.beginPath();
+    g.strokeStyle = 'rgba(255,255,255,.34)';
+    g.lineWidth = 0.9*s;
+    g.beginPath();
     for(var i=0;i<7;i++){
-      if(i === 0) ctx.moveTo(pts[i][0], pts[i][1] - 1*s);
-      else ctx.lineTo(pts[i][0], pts[i][1] - 1*s);
+      if(i === 0) g.moveTo(pts[i][0], pts[i][1] - 1*s);
+      else g.lineTo(pts[i][0], pts[i][1] - 1*s);
     }
-    ctx.stroke();
+    g.stroke();
 
-    // ---------- 四条腿：交替步态 + 小脚掌与爪尖 ----------
+    // 四足交替步态 + 脚掌爪尖
     function drawLeg(px, py, phase){
-      var swing = Math.sin(clock*19 + phase)*5.5*s*run;
+      var swing = Math.sin(p*3 + phase)*5.5*s;
       var fx = px + swing, fy = py + Math.abs(swing)*0.12;
-      ctx.strokeStyle = 'rgba(148,168,18,.9)';
-      ctx.lineWidth = 2.8*s;
-      ctx.beginPath(); ctx.moveTo(px, py*0.45); ctx.lineTo(fx, fy); ctx.stroke();
-      ctx.fillStyle = '#EAF63F';
-      ctx.beginPath(); ctx.ellipse(fx + 1.2*s, fy, 4*s, 2.2*s, 0, 0, TAU); ctx.fill();
-      ctx.strokeStyle = 'rgba(255,255,255,.45)';
-      ctx.lineWidth = 0.8*s;
-      ctx.beginPath();
-      ctx.moveTo(fx+4*s, fy-0.8*s); ctx.lineTo(fx+6*s,   fy-1.3*s);
-      ctx.moveTo(fx+4*s, fy);       ctx.lineTo(fx+6.4*s, fy);
-      ctx.moveTo(fx+4*s, fy+0.8*s); ctx.lineTo(fx+6*s,   fy+1.3*s);
-      ctx.stroke();
+      g.strokeStyle = 'rgba(148,168,18,.9)';
+      g.lineWidth = 2.8*s;
+      g.beginPath(); g.moveTo(px, py*0.45); g.lineTo(fx, fy); g.stroke();
+      g.fillStyle = '#EAF63F';
+      g.beginPath(); g.ellipse(fx + 1.2*s, fy, 4*s, 2.2*s, 0, 0, TAU); g.fill();
+      g.strokeStyle = 'rgba(255,255,255,.45)';
+      g.lineWidth = 0.8*s;
+      g.beginPath();
+      g.moveTo(fx+4*s, fy-0.8*s); g.lineTo(fx+6*s,   fy-1.3*s);
+      g.moveTo(fx+4*s, fy);       g.lineTo(fx+6.4*s, fy);
+      g.moveTo(fx+4*s, fy+0.8*s); g.lineTo(fx+6*s,   fy+1.3*s);
+      g.stroke();
     }
     drawLeg(-17*s, -18.5*s, 0);
     drawLeg(-17*s,  18.5*s, Math.PI);
     drawLeg( 13*s, -17.5*s, Math.PI);
     drawLeg( 13*s,  17.5*s, 0);
 
-    // ---------- 一体化纺锤形身体：尾根 → 肩 → 尖吻 ----------
-    ctx.beginPath();
-    ctx.moveTo(-31*s, 0);
-    ctx.bezierCurveTo(-30*s, -13*s, -10*s, -19*s, 10*s, -16*s);
-    ctx.bezierCurveTo( 22*s, -14*s,  31*s, -10*s, 41*s, -4.5*s);
-    ctx.quadraticCurveTo(49*s, 0, 41*s, 4.5*s);
-    ctx.bezierCurveTo( 31*s,  10*s,  22*s,  14*s, 10*s,  16*s);
-    ctx.bezierCurveTo(-10*s,  19*s, -30*s,  13*s,-31*s, 0);
-    ctx.closePath();
+    // 一体化纺锤形身体
+    g.beginPath();
+    g.moveTo(-31*s, 0);
+    g.bezierCurveTo(-30*s, -13*s, -10*s, -19*s, 10*s, -16*s);
+    g.bezierCurveTo( 22*s, -14*s,  31*s, -10*s, 41*s, -4.5*s);
+    g.quadraticCurveTo(49*s, 0, 41*s, 4.5*s);
+    g.bezierCurveTo( 31*s,  10*s,  22*s,  14*s, 10*s,  16*s);
+    g.bezierCurveTo(-10*s,  19*s, -30*s,  13*s,-31*s, 0);
+    g.closePath();
+    var fur = g.createLinearGradient(0, -18*s, 0, 18*s);
+    fur.addColorStop(0, '#FBFF86'); fur.addColorStop(0.38, '#F4FF45');
+    fur.addColorStop(0.72, '#E2EF2C'); fur.addColorStop(1, '#B9CE1C');
+    g.shadowColor = 'rgba(240,255,70,.5)';
+    g.shadowBlur = 20*s;
+    g.fillStyle = fur;
+    g.fill();
+    g.shadowBlur = 0;
+    g.strokeStyle = 'rgba(105,125,10,.55)';
+    g.lineWidth = 1.4*s;
+    g.stroke();   // 路径仍是身体，描边须紧接 fill
 
-    var fur = ctx.createLinearGradient(0, -18*s, 0, 18*s);
-    fur.addColorStop(0,    '#FBFF86');
-    fur.addColorStop(0.38, '#F4FF45');
-    fur.addColorStop(0.72, '#E2EF2C');
-    fur.addColorStop(1,    '#B9CE1C');
-    ctx.shadowColor = 'rgba(240,255,70,.5)';
-    ctx.shadowBlur = 20*s;
-    ctx.fillStyle = fur;
-    ctx.fill();
-    ctx.shadowBlur = 0;
-    ctx.strokeStyle = 'rgba(105,125,10,.55)';
-    ctx.lineWidth = 1.4*s;
-    ctx.stroke();   // 描身体轮廓（须紧接 fill，路径仍是身体）
+    // 脸部浅色区与背部高光
+    g.fillStyle = 'rgba(255,255,255,.10)';
+    g.beginPath(); g.ellipse(30*s, 0, 15*s, 8.5*s, 0, 0, TAU); g.fill();
+    g.strokeStyle = 'rgba(255,255,255,.26)';
+    g.lineWidth = 2.3*s;
+    g.beginPath();
+    g.moveTo(-22*s, -5*s);
+    g.bezierCurveTo(-8*s, -12*s, 10*s, -12*s, 27*s, -7*s);
+    g.stroke();
 
-    // 脸部浅色区与背部柔和高光
-    ctx.fillStyle = 'rgba(255,255,255,.10)';
-    ctx.beginPath(); ctx.ellipse(30*s, 0, 15*s, 8.5*s, 0, 0, TAU); ctx.fill();
-    ctx.strokeStyle = 'rgba(255,255,255,.26)';
-    ctx.lineWidth = 2.3*s;
-    ctx.beginPath();
-    ctx.moveTo(-22*s, -5*s);
-    ctx.bezierCurveTo(-8*s, -12*s, 10*s, -12*s, 27*s, -7*s);
-    ctx.stroke();
-
-    // ---------- 半露圆耳：平边贴住身体、弧边朝外，避免「纽扣感」 ----------
+    // 半露圆耳
     function drawEar(sign){
-      ctx.save();
-      ctx.translate(8*s, sign*13*s + earFlap*sign);
-      ctx.rotate(sign*0.16);
-      ctx.scale(1, sign);                 // 统一让局部 +y 指向身体外侧
+      g.save();
+      g.translate(8*s, sign*13*s + earFlap*sign);
+      g.rotate(sign*0.16);
+      g.scale(1, sign);
       var R = 9*s, r = 5.4*s;
-      var eg = ctx.createRadialGradient(-2*s, 2*s, 0.5*s, 0, 0, R);
+      var eg = g.createRadialGradient(-2*s, 2*s, 0.5*s, 0, 0, R);
       eg.addColorStop(0, '#FFFBA6'); eg.addColorStop(1, '#DCE92A');
-      ctx.fillStyle = eg;
-      ctx.beginPath();
-      ctx.moveTo(R, 0);
-      ctx.arc(0, 0, R, 0, Math.PI, false);
-      ctx.closePath();
-      ctx.fill();
-      ctx.strokeStyle = 'rgba(110,130,10,.45)';
-      ctx.lineWidth = 1.1*s;
-      ctx.stroke();
-      var ig = ctx.createRadialGradient(-1*s, 1*s, 0.4*s, 0, 0, r);
+      g.fillStyle = eg;
+      g.beginPath(); g.moveTo(R, 0); g.arc(0, 0, R, 0, Math.PI, false); g.closePath(); g.fill();
+      g.strokeStyle = 'rgba(110,130,10,.45)';
+      g.lineWidth = 1.1*s;
+      g.stroke();
+      var ig = g.createRadialGradient(-1*s, 1*s, 0.4*s, 0, 0, r);
       ig.addColorStop(0, '#A7E9FF'); ig.addColorStop(1, '#2B8FCB');
-      ctx.fillStyle = ig;
-      ctx.beginPath();
-      ctx.moveTo(r, 0);
-      ctx.arc(0, 0, r, 0, Math.PI, false);
-      ctx.closePath();
-      ctx.fill();
-      ctx.strokeStyle = 'rgba(255,255,255,.3)';
-      ctx.lineWidth = 0.8*s;
-      ctx.beginPath();
-      ctx.moveTo(-2.5*s, 1.2*s);
-      ctx.quadraticCurveTo(0, 3.2*s, 2.5*s, 1.4*s);
-      ctx.stroke();
-      ctx.restore();
+      g.fillStyle = ig;
+      g.beginPath(); g.moveTo(r, 0); g.arc(0, 0, r, 0, Math.PI, false); g.closePath(); g.fill();
+      g.strokeStyle = 'rgba(255,255,255,.3)';
+      g.lineWidth = 0.8*s;
+      g.beginPath();
+      g.moveTo(-2.5*s, 1.2*s);
+      g.quadraticCurveTo(0, 3.2*s, 2.5*s, 1.4*s);
+      g.stroke();
+      g.restore();
     }
     drawEar(-1); drawEar(1);
 
-    // ---------- 眼睛（带高光）、鼻尖、弧形胡须 ----------
+    // 眼睛、鼻尖、胡须
     function drawEye(sign){
       var ex = 31*s, ey = sign*7*s;
-      ctx.fillStyle = '#0E1626';
-      ctx.beginPath(); ctx.ellipse(ex, ey, 3.5*s, 4*s, 0, 0, TAU); ctx.fill();
-      ctx.fillStyle = 'rgba(255,255,255,.92)';
-      ctx.beginPath(); ctx.arc(ex-1.1*s, ey-1.4*s, 1.25*s, 0, TAU); ctx.fill();
-      ctx.fillStyle = 'rgba(110,210,255,.85)';
-      ctx.beginPath(); ctx.arc(ex+1.2*s, ey+1.3*s, 0.8*s, 0, TAU); ctx.fill();
+      g.fillStyle = '#0E1626';
+      g.beginPath(); g.ellipse(ex, ey, 3.5*s, 4*s, 0, 0, TAU); g.fill();
+      g.fillStyle = 'rgba(255,255,255,.92)';
+      g.beginPath(); g.arc(ex-1.1*s, ey-1.4*s, 1.25*s, 0, TAU); g.fill();
+      g.fillStyle = 'rgba(110,210,255,.85)';
+      g.beginPath(); g.arc(ex+1.2*s, ey+1.3*s, 0.8*s, 0, TAU); g.fill();
     }
     drawEye(-1); drawEye(1);
-
-    ctx.fillStyle = '#3FB6F0';
-    ctx.beginPath(); ctx.ellipse(48*s, 0, 3.4*s, 2.6*s, 0, 0, TAU); ctx.fill();
-    ctx.fillStyle = 'rgba(255,255,255,.8)';
-    ctx.beginPath(); ctx.arc(47*s, -0.9*s, 1*s, 0, TAU); ctx.fill();
-
-    ctx.strokeStyle = 'rgba(255,255,255,.38)';
-    ctx.lineWidth = 0.9*s;
+    g.fillStyle = '#3FB6F0';
+    g.beginPath(); g.ellipse(48*s, 0, 3.4*s, 2.6*s, 0, 0, TAU); g.fill();
+    g.fillStyle = 'rgba(255,255,255,.8)';
+    g.beginPath(); g.arc(47*s, -0.9*s, 1*s, 0, TAU); g.fill();
+    g.strokeStyle = 'rgba(255,255,255,.38)';
+    g.lineWidth = 0.9*s;
     for(var q=-1;q<=1;q+=2){
       for(var k=0;k<3;k++){
         var y0 = q*(1.2 + k*1.2)*s, y1 = q*(4 + k*3.2)*s;
-        ctx.beginPath();
-        ctx.moveTo(44*s, y0);
-        ctx.quadraticCurveTo(50*s, y0 + q*0.6*s, 54*s + k*1.5*s, y1);
-        ctx.stroke();
+        g.beginPath();
+        g.moveTo(44*s, y0);
+        g.quadraticCurveTo(50*s, y0 + q*0.6*s, 54*s + k*1.5*s, y1);
+        g.stroke();
       }
     }
+    g.restore();
+  }
+
+  function buildSprites(){
+    var s = S;
+    sprCx = 116*s; sprCy = 56*s;           // 覆盖尾巴 -86*s 与柔光/发光边界
+    sprW = sprCx + 90*s; sprH = 2*sprCy;
+    for(var i=0;i<sprites.length;i++){ sprites[i].width = 0; sprites[i].height = 0; }
+    sprites = [];
+    for(var f=0;f<SPRITE_N;f++){
+      var c = document.createElement('canvas');
+      c.width = Math.ceil(sprW*DPR);
+      c.height = Math.ceil(sprH*DPR);
+      var g = c.getContext('2d');
+      g.setTransform(DPR, 0, 0, DPR, 0, 0);
+      g.translate(sprCx, sprCy);
+      renderMouseSprite(g, s, Math.PI*2*f/SPRITE_N);
+      sprites.push(c);
+    }
+  }
+
+  function drawMouse(m){
+    if(!m || !sprites.length) return;
+    var fade = m.alive ? 1 : Math.max(0, 1 - m.deadT/0.42);
+    if(fade <= 0) return;
+    var img = sprites[Math.floor(m.animPhase) % SPRITE_N];
+    ctx.save();
+    ctx.globalAlpha = fade;
+    ctx.translate(m.x, m.y);
+    ctx.rotate(m.heading + (m.alive ? 0 : m.deadT*3.2));
+    var ds = m.alive ? 1 : Math.max(0.6, 1 - m.deadT*0.75);
+    ctx.scale(ds, ds);
+    ctx.drawImage(img, -sprCx, -sprCy, sprW, sprH);
     ctx.restore();
   }
 
@@ -589,7 +650,7 @@
   // ---------- 触摸命中（猫爪，容差半径大） ----------
   function hitTest(list){
     if(!mouse || !mouse.alive) return;
-    var r = 50*mouse.s + 24;
+    var r = 56*mouse.s + 28;   // 速度提高后适当放宽命中容差
     for(var i=0;i<list.length;i++){
       var p = list[i];
       if(!p) continue;
@@ -618,10 +679,7 @@
     var dt = Math.min(0.05, (now - last)/1000 || 0.016);
     last = now; clock += dt;
     ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
-    ctx.fillStyle = '#050912';
-    ctx.fillRect(0, 0, W, H);
-    ctx.fillStyle = bgGrad;
-    ctx.fillRect(0, 0, W, H);
+    ctx.drawImage(bgCanvas, 0, 0, W, H);   // 预渲染背景，一次纹理拷贝
     updateMouse(dt, now);
     updateParticles(dt);
     drawParticles();
