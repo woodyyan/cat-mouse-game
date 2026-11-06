@@ -38,8 +38,9 @@
   var clock=0, last=0;
   var mouse=null;
   var particles=[];
-  var audio=null, master=null, noiseBuf=null;
   var fsAttempts=0, wakeLock=null;
+  var soundReady=false, sfx={squeak:[],rustle:[],death:[]}, keepAlive=null;
+  var hintTimer=null;
 
   // ---------- 尺寸 / 背景 ----------
   function resize(){
@@ -56,73 +57,157 @@
     bgGrad.addColorStop(1, '#04060e');
   }
 
-  // ---------- 声音：Web Audio 合成老鼠高频吱声 + 窸窣声（3–7 kHz，猫敏感频段） ----------
-  function initAudio(){
-    if(audio){ if(audio.state==='suspended') audio.resume(); return; }
-    var AC = window.AudioContext || window.webkitAudioContext;
-    if(!AC) return;
-    try{
-      audio = new AC();
-      master = audio.createGain();
-      master.gain.value = 0.17;
-      master.connect(audio.destination);
-      var len = Math.floor(audio.sampleRate*0.45);
-      noiseBuf = audio.createBuffer(1, len, audio.sampleRate);
-      var d = noiseBuf.getChannelData(0);
-      for(var i=0;i<len;i++) d[i] = Math.random()*2-1;
-      if(audio.state==='suspended') audio.resume();
-      // iOS 首次手势内播放一帧静音，解锁音频通道
-      var prime = audio.createBufferSource();
-      prime.buffer = audio.createBuffer(1, 1, audio.sampleRate);
-      prime.connect(audio.destination);
-      prime.start(0);
-    }catch(e){ audio=null; }
-  }
+  // ---------- 声音：预合成 WAV + HTMLAudioElement ----------
+  // iPadOS Safari 默认把 Web Audio 归为 ambient 音频会话，静音开关会直接掐掉输出；
+  // HTML5 <audio> 属于 playback 会话，不受静音开关影响，因此改用 <audio> 发声。
+  var SR = 44100;
 
-  function chirp(vol, dur, f0, f1){
-    if(!audio || audio.state!=='running') return;
-    var t = audio.currentTime;
-    var o = audio.createOscillator(), g = audio.createGain();
-    o.type = 'triangle';
-    o.frequency.setValueAtTime(f0, t);
-    o.frequency.exponentialRampToValueAtTime(Math.max(200,f1), t + dur*0.45);
-    o.frequency.exponentialRampToValueAtTime(Math.max(200,f0*0.72), t + dur);
-    g.gain.setValueAtTime(0.0001, t);
-    g.gain.exponentialRampToValueAtTime(vol, t + 0.012);
-    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
-    o.connect(g); g.connect(master);
-    o.start(t); o.stop(t + dur + 0.02);
-  }
-
-  function squeak(){
-    var f = 3400 + Math.random()*1900;
-    chirp(0.45 + Math.random()*0.28, 0.09 + Math.random()*0.08, f, f*(1.45 + Math.random()*0.55));
-    if(Math.random() < 0.55){
-      var delay = 85 + Math.random()*75;
-      setTimeout(function(){ chirp(0.26, 0.06, f*1.08, f*1.75); }, delay);
+  function wavURI(samples){
+    var n = samples.length, buf = new ArrayBuffer(44 + n*2), v = new DataView(buf);
+    function put(off, s){ for(var k=0;k<s.length;k++) v.setUint8(off+k, s.charCodeAt(k)); }
+    put(0,'RIFF');  v.setUint32(4, 36+n*2, true); put(8,'WAVE');
+    put(12,'fmt '); v.setUint32(16,16,true); v.setUint16(20,1,true); v.setUint16(22,1,true);
+    v.setUint32(24,SR,true); v.setUint32(28,SR*2,true); v.setUint16(32,2,true); v.setUint16(34,16,true);
+    put(36,'data'); v.setUint32(40,n*2,true);
+    for(var i=0;i<n;i++){
+      var q = Math.max(-1, Math.min(1, samples[i]));
+      v.setInt16(44+i*2, q<0 ? q*0x8000 : q*0x7FFF, true);
     }
+    var bytes = new Uint8Array(buf), bin = '', step = 0x8000;
+    for(var j=0;j<bytes.length;j+=step){
+      bin += String.fromCharCode.apply(null, bytes.subarray(j, j+step));
+    }
+    return 'data:audio/wav;base64,' + btoa(bin);
   }
 
-  function rustle(){
-    if(!audio || audio.state!=='running' || !noiseBuf) return;
-    var t = audio.currentTime;
-    var src = audio.createBufferSource(), bp = audio.createBiquadFilter(), g = audio.createGain();
-    src.buffer = noiseBuf;
-    bp.type = 'bandpass';
-    bp.frequency.value = 2800 + Math.random()*2800;
-    bp.Q.value = 1.1;
-    var dur = 0.12 + Math.random()*0.12;
-    g.gain.setValueAtTime(0.0001, t);
-    g.gain.exponentialRampToValueAtTime(0.11, t + 0.02);
-    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
-    src.connect(bp); bp.connect(g); g.connect(master);
-    src.start(t); src.stop(t + dur + 0.02);
+  // 吱声：2.2–5.6 kHz 扫频 + 8–17 kHz 谐波（猫敏感）+ 低频共振（iPad 扬声器/人耳可听）
+  function makeSqueak(f0, dur){
+    var n = Math.floor(SR*dur), out = new Float32Array(n), ph = 0, low = 0;
+    for(var i=0;i<n;i++){
+      var u = i/n, t = i/SR;
+      var f = f0*(1 + 0.55*Math.sin(Math.PI*u) - 0.3*u);
+      ph  += 2*Math.PI*f/SR;
+      low += 2*Math.PI*(f*0.42)/SR;
+      var env = Math.min(1, t/0.006)*Math.pow(1-u, 1.25);
+      var trem = 0.86 + 0.14*Math.sin(2*Math.PI*38*t);
+      out[i] = 0.85*env*trem*(0.55*Math.sin(ph) + 0.2*Math.sin(2*ph) +
+                              0.08*Math.sin(3*ph) + 0.18*Math.sin(low));
+    }
+    return wavURI(out);
   }
 
+  function makeRustle(){
+    var dur = 0.2, n = Math.floor(SR*dur), out = new Float32Array(n), lp = 0;
+    for(var i=0;i<n;i++){
+      var u = i/n, t = i/SR;
+      lp += ((Math.random()*2-1) - lp)*0.22;
+      var env = Math.min(1, t/0.01)*Math.pow(1-u,1.5)*(0.8+0.2*Math.sin(2*Math.PI*25*t));
+      out[i] = env*lp*0.9;
+    }
+    return wavURI(out);
+  }
+
+  function makeDeath(){
+    var dur = 0.42, n = Math.floor(SR*dur), out = new Float32Array(n), ph = 0;
+    for(var i=0;i<n;i++){
+      var u = i/n, t = i/SR;
+      ph += 2*Math.PI*(4200*Math.pow(0.22,u))/SR;
+      var env = Math.min(1, t/0.008)*Math.pow(1-u,0.8)*(0.85+0.15*Math.sin(2*Math.PI*30*t));
+      out[i] = env*(0.55*Math.sin(ph) + 0.2*Math.sin(2*ph) + 0.12*(Math.random()*2-1));
+    }
+    return wavURI(out);
+  }
+
+  function makeSilence(){
+    return wavURI(new Float32Array(Math.floor(SR*0.5)));
+  }
+
+  function mkAudio(uri, vol, loop){
+    var a = document.createElement('audio');
+    a.src = uri;
+    a.preload = 'auto';
+    a.volume = vol;
+    a.loop = !!loop;
+    a.setAttribute('playsinline','');
+    a.setAttribute('webkit-playsinline','');
+    a.style.cssText = 'position:absolute;width:1px;height:1px;opacity:0;pointer-events:none';
+    document.body.appendChild(a);
+    return a;
+  }
+
+  // Safari 17+：直接声明 playback 会话，静音模式下也能出声
+  function setPlaybackSession(){
+    try{ if(navigator.audioSession) navigator.audioSession.type = 'playback'; }catch(e){}
+  }
+
+  function buildSounds(){
+    sfx.squeak = [
+      mkAudio(makeSqueak(2200, 0.13),  0.85),
+      mkAudio(makeSqueak(2900, 0.11),  0.85),
+      mkAudio(makeSqueak(3600, 0.095), 0.85)
+    ];
+    sfx.rustle = [mkAudio(makeRustle(), 0.7)];
+    sfx.death  = [mkAudio(makeDeath(), 0.9)];
+    keepAlive  = mkAudio(makeSilence(), 1, true);
+    setPlaybackSession();
+  }
+
+  function showAudioHint(ok){
+    if(!hint || !hint.parentNode) return;
+    hint.textContent = ok ? '声音已开启' : '声音被拦截 · 再轻触一次屏幕';
+    hint.classList.remove('off');
+    clearTimeout(hintTimer);
+    hintTimer = setTimeout(function(){ hint.classList.add('off'); }, 1800);
+  }
+
+  // iOS 要求：解锁必须发生在用户手势的同步调用栈内，不能在任何异步之后
+  function unlockAudio(){
+    if(soundReady) return;
+    soundReady = true;
+    setPlaybackSession();
+    var all = sfx.squeak.concat(sfx.rustle, sfx.death, [keepAlive]);
+    for(var i=0;i<all.length;i++){
+      try{
+        var p = all[i].play();
+        if(p && p.catch) p.catch(function(){});
+        all[i].pause();
+        all[i].currentTime = 0;
+      }catch(e){}
+    }
+    // 静音 loop 持续把会话保持在 playback 类别（兼容 iOS 16 及以下）
+    try{ var q = keepAlive.play(); if(q && q.catch) q.catch(function(){}); }catch(e){}
+    setTimeout(function(){ playSfx('squeak'); }, 130);
+    showAudioHint(true);
+  }
+
+  function playSfx(kind){
+    if(!soundReady) return;
+    var arr = sfx[kind];
+    if(!arr || !arr.length) return;
+    var a = arr.length > 1 ? arr[Math.floor(Math.random()*arr.length)] : arr[0];
+    try{
+      a.pause();
+      a.currentTime = 0;
+      var p = a.play();
+      if(p && p.catch) p.catch(function(){
+        soundReady = false;                 // 会话被系统中断，下次触摸重新解锁
+        showAudioHint(false);
+      });
+    }catch(e){}
+  }
+
+  // 全屏切换 / 回到前台后重新激活音频会话
+  function reactivateAudio(){
+    if(!soundReady) return;
+    setPlaybackSession();
+    try{ var p = keepAlive.play(); if(p && p.catch) p.catch(function(){}); }catch(e){}
+  }
+
+  function squeak(){ playSfx('squeak'); }
+  function rustle(){ playSfx('rustle'); }
   function deathSound(){
-    chirp(0.5, 0.32, 5200, 900);
-    setTimeout(function(){ chirp(0.24, 0.2, 3000, 1100); }, 70);
-    rustle();
+    playSfx('death');
+    setTimeout(function(){ playSfx('squeak'); }, 110);
   }
 
   // ---------- 全屏 / 防误触 ----------
@@ -156,10 +241,15 @@
 
   document.addEventListener('visibilitychange', function(){
     if(document.visibilityState === 'visible'){
-      if(audio && audio.state === 'suspended') audio.resume();
+      reactivateAudio();
       keepAwake();
     }
   });
+  // 全屏切换会重建音频会话，切换完成后重新激活
+  ['fullscreenchange','webkitfullscreenchange'].forEach(function(n){
+    document.addEventListener(n, function(){ setTimeout(reactivateAudio, 200); });
+  });
+  window.addEventListener('pageshow', function(){ setTimeout(reactivateAudio, 200); });
 
   ['gesturestart','gesturechange','gestureend','dblclick','contextmenu','dragstart','selectstart']
     .forEach(function(n){ document.addEventListener(n, function(e){ e.preventDefault(); }, {passive:false}); });
@@ -401,19 +491,19 @@
   }
 
   function onStart(e){
-    initAudio();
+    unlockAudio();
     tryFullscreen();
     keepAwake();
-    hint.classList.add('off');
     hitTest(e.changedTouches && e.changedTouches.length ? e.changedTouches : [e]);
   }
   function onMove(e){
+    if(!soundReady) unlockAudio();
     hitTest(e.touches && e.touches.length ? e.touches : [e]);
   }
   document.addEventListener('touchstart', onStart, {passive:false});
   document.addEventListener('touchmove',  onMove,  {passive:false});
   document.addEventListener('mousedown',  onStart, {passive:false});
-  document.addEventListener('click',      tryFullscreen, {passive:true});
+  document.addEventListener('click', function(){ unlockAudio(); tryFullscreen(); }, {passive:true});
 
   // ---------- 主循环 ----------
   function frame(now){
@@ -440,12 +530,12 @@
   hint.textContent = standalone
     ? '轻触屏幕开启声音 · 把 iPad 自动锁定设为「永不」效果更佳'
     : '轻触屏幕开启声音与全屏 · 分享 → 添加到主屏幕可彻底隐藏浏览器栏';
-  setTimeout(function(){ hint.classList.add('off'); }, 5000);
-  setTimeout(function(){ if(hint.parentNode) hint.parentNode.removeChild(hint); }, 6500);
+  setTimeout(function(){ if(!hintTimer) hint.classList.add('off'); }, 5000);
+  // hint 常驻 DOM（仅淡出），用于首次触摸后回显音频状态
 
-  // 立即开跑；声音在首次触摸后由系统解锁
+  buildSounds();                  // 预合成全部音效并挂载 <audio> 元素
   mouse = spawn(false);
-  requestAnimationFrame(frame);
+  requestAnimationFrame(frame);   // 立即开跑；声音在首次触摸后解锁
 })();
 </script>
 </body>
